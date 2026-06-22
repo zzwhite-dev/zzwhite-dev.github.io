@@ -4,11 +4,14 @@
   document.body.prepend(canvas);
 
   const ctx = canvas.getContext("2d");
+
   let width;
   let height;
-  let particles = [];
-  const particleCount = 80;
-  const maxDistance = 140;
+  let neurons = [];
+  let pulses = [];
+
+  const neuronCount = 42;
+  const maxConnectionDistance = 190;
   const mouse = { x: null, y: null };
 
   function resize() {
@@ -17,66 +20,148 @@
     canvas.width = width;
     canvas.height = height;
 
-    particles = Array.from({ length: particleCount }, () => ({
-      x: Math.random() * width,
-      y: Math.random() * height,
-      vx: (Math.random() - 0.5) * 0.35,
-      vy: (Math.random() - 0.5) * 0.35,
-      r: Math.random() * 1.8 + 1,
-      pulse: Math.random() * Math.PI * 2,
+    neurons = Array.from({ length: neuronCount }, () => createNeuron());
+  }
+
+  function createNeuron(x, y) {
+    const dendrites = Array.from({ length: 4 + Math.floor(Math.random() * 4) }, () => ({
+      angle: Math.random() * Math.PI * 2,
+      length: 14 + Math.random() * 22,
+      branch: 6 + Math.random() * 10,
     }));
+
+    return {
+      x: x ?? Math.random() * width,
+      y: y ?? Math.random() * height,
+      vx: (Math.random() - 0.5) * 0.25,
+      vy: (Math.random() - 0.5) * 0.25,
+      radius: 3.2 + Math.random() * 2.2,
+      phase: Math.random() * Math.PI * 2,
+      dendrites,
+    };
+  }
+
+  function drawNeuron(n) {
+    n.phase += 0.025;
+    const glow = 0.45 + 0.55 * Math.sin(n.phase);
+
+    // dendrite arms
+    for (const d of n.dendrites) {
+      const x1 = n.x + Math.cos(d.angle) * n.radius;
+      const y1 = n.y + Math.sin(d.angle) * n.radius;
+      const x2 = n.x + Math.cos(d.angle) * d.length;
+      const y2 = n.y + Math.sin(d.angle) * d.length;
+
+      ctx.strokeStyle = `rgba(110, 220, 240, ${0.16 + glow * 0.08})`;
+      ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      // tiny secondary branch
+      const branchAngle = d.angle + (Math.random() > 0.5 ? 0.55 : -0.55);
+      const xb = x2 + Math.cos(branchAngle) * d.branch;
+      const yb = y2 + Math.sin(branchAngle) * d.branch;
+
+      ctx.beginPath();
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(xb, yb);
+      ctx.stroke();
+    }
+
+    // soma/cell body
+    ctx.fillStyle = `rgba(130, 230, 245, ${0.38 + glow * 0.35})`;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.radius + glow * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+
+    // inner nucleus dot
+    ctx.fillStyle = `rgba(230, 255, 255, ${0.35 + glow * 0.25})`;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.radius * 0.35, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function updateNeuron(n) {
+    n.x += n.vx;
+    n.y += n.vy;
+
+    if (n.x < -30 || n.x > width + 30) n.vx *= -1;
+    if (n.y < -30 || n.y > height + 30) n.vy *= -1;
+
+    if (mouse.x !== null) {
+      const dx = n.x - mouse.x;
+      const dy = n.y - mouse.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+
+      if (d < 120) {
+        n.x += dx / 85;
+        n.y += dy / 85;
+      }
+    }
+  }
+
+  function drawConnections() {
+    for (let i = 0; i < neurons.length; i++) {
+      for (let j = i + 1; j < neurons.length; j++) {
+        const a = neurons[i];
+        const b = neurons[j];
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        if (distance < maxConnectionDistance) {
+          const opacity = 1 - distance / maxConnectionDistance;
+
+          ctx.strokeStyle = `rgba(85, 190, 220, ${opacity * 0.17})`;
+          ctx.lineWidth = 0.9;
+
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+
+          // slight curve so it feels more organic than straight geometry
+          const mx = (a.x + b.x) / 2 + Math.sin(a.phase) * 10;
+          const my = (a.y + b.y) / 2 + Math.cos(b.phase) * 10;
+
+          ctx.quadraticCurveTo(mx, my, b.x, b.y);
+          ctx.stroke();
+        }
+      }
+    }
+  }
+
+  function drawPulses() {
+    pulses = pulses.filter((p) => p.life < 1);
+
+    for (const p of pulses) {
+      p.life += 0.018;
+
+      const radius = p.life * 85;
+      const opacity = 1 - p.life;
+
+      ctx.strokeStyle = `rgba(140, 230, 255, ${opacity * 0.35})`;
+      ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
 
   function draw() {
     ctx.clearRect(0, 0, width, height);
 
-    for (const p of particles) {
-      p.x += p.vx;
-      p.y += p.vy;
-      p.pulse += 0.03;
-
-      if (p.x < 0 || p.x > width) p.vx *= -1;
-      if (p.y < 0 || p.y > height) p.vy *= -1;
-
-      if (mouse.x !== null) {
-        const dx = p.x - mouse.x;
-        const dy = p.y - mouse.y;
-        const d = Math.sqrt(dx * dx + dy * dy);
-
-        if (d < 100) {
-          p.x += dx / 60;
-          p.y += dy / 60;
-        }
-      }
+    for (const n of neurons) {
+      updateNeuron(n);
     }
 
-    for (let i = 0; i < particles.length; i++) {
-      for (let j = i + 1; j < particles.length; j++) {
-        const a = particles[i];
-        const b = particles[j];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const d = Math.sqrt(dx * dx + dy * dy);
+    drawConnections();
 
-        if (d < maxDistance) {
-          const opacity = 1 - d / maxDistance;
-          ctx.strokeStyle = `rgba(80, 200, 230, ${opacity * 0.2})`;
-          ctx.lineWidth = 0.8;
-          ctx.beginPath();
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(b.x, b.y);
-          ctx.stroke();
-        }
-      }
+    for (const n of neurons) {
+      drawNeuron(n);
     }
 
-    for (const p of particles) {
-      const glow = 0.5 + 0.5 * Math.sin(p.pulse);
-      ctx.fillStyle = `rgba(120, 225, 245, ${0.4 + glow * 0.35})`;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.r + glow * 0.7, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    drawPulses();
 
     requestAnimationFrame(draw);
   }
@@ -94,17 +179,11 @@
   });
 
   window.addEventListener("click", function (e) {
-    particles.push({
-      x: e.clientX,
-      y: e.clientY,
-      vx: (Math.random() - 0.5) * 1.3,
-      vy: (Math.random() - 0.5) * 1.3,
-      r: 2.4,
-      pulse: 0,
-    });
+    neurons.push(createNeuron(e.clientX, e.clientY));
+    pulses.push({ x: e.clientX, y: e.clientY, life: 0 });
 
-    if (particles.length > 100) {
-      particles.shift();
+    if (neurons.length > 60) {
+      neurons.shift();
     }
   });
 
