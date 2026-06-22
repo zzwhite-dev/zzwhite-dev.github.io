@@ -1,0 +1,4 @@
+User-agent: *
+Disallow:
+
+Sitemap: https://zzwhite-dev.github.io/al-folio/sitemap.xml
