@@ -13,72 +13,70 @@
   const ctx = canvas.getContext("2d");
 
   const SETTINGS = {
-    pointCount: 65,
-    maxDistance: 140,
-    maxLinksPerPoint: 3,
+    // ---- flow-field particle storm ----
+    particleCount: 420,
+    particleSpeedMin: 0.6,
+    particleSpeedMax: 1.8,
+    particleFadeAlpha: 0.085, // lower = longer trails (canvas not fully cleared each frame)
+    particleSize: 1.15,
 
-    driftSpeed: 0.018,
+    // flow field tuning (layered sine noise, animates over time)
+    flowScale: 0.0026, // spatial frequency of the field
+    flowScale2: 0.0055, // second octave, adds detail
+    flowTimeSpeed: 0.00012, // how fast the field itself evolves
+    flowStrength: 0.18, // turn rate per frame
 
-    // local orbiting: each point loops in a small circle around its home position
-    orbitRadiusMin: 5,
-    orbitRadiusMax: 14,
-    orbitSpeedMin: 0.004,
-    orbitSpeedMax: 0.012,
+    particleColorCold: "70, 140, 210", // slower particles
+    particleColorHot: "150, 230, 255", // faster particles (closer to cursor / vortex)
 
-    // global rotation: the entire field slowly spins around the canvas center
-    globalRotationSpeed: 0.00006, // radians per ms
+    // ---- magnetic anchor network ----
+    anchorCount: 24,
+    anchorMaxDistance: 230,
+    anchorMaxLinks: 3,
+    anchorDriftSpeed: 0.05,
+    anchorRadiusMin: 1.8,
+    anchorRadiusMax: 3.4,
+    anchorColor: "160, 215, 255",
+    anchorLineColor: "100, 175, 230",
+    anchorLineBaseAlpha: 0.16,
 
-    pointRadiusMin: 1.1,
-    pointRadiusMax: 2.4,
+    // ---- cursor: magnet + vortex ----
+    magnetRadius: 230, // how far the magnet bends nearby connection lines
+    magnetStrength: 70, // max px the line midpoint bends toward cursor
+    vortexRadius: 170, // how far the cursor swirls the particle flow
+    vortexStrength: 0.06, // added rotational pull near cursor, blended into flow direction
+    cursorGlowRadius: 16,
 
-    baseDotAlpha: 0.32,
-    lineAlpha: 0.10,
-
-    // electrical-signal palette (cool blue/cyan)
-    dotColor: "150, 210, 255",
-    lineColor: "110, 170, 210",
-    pulseColor: "120, 230, 255",
-    nodeFireColor: "180, 240, 255",
-    constellationColor: "140, 200, 255",
-
-    ambientEventEveryMs: 1800,
-    ambientHops: 3, // how many edges an ambient signal travels
-
-    mouseRadius: 130,
-    mouseRepelStrength: 18, // px of max push at center of radius
-    mouseGlowRadius: 160, // wider than repel radius, so glow announces before the push
-    mouseGlowStrength: 0.85, // max added alpha boost at zero distance
-
-    pulseSpeed: 0.045, // fraction of edge length per frame
-    pulseTrailAlpha: 0.9,
-
-    // constellation polygons: translucent shapes that form & dissolve between clusters
-    constellationEveryMs: 2600,
-    constellationMaxConcurrent: 3,
-    constellationFadeInMs: 900,
-    constellationHoldMs: 1100,
-    constellationFadeOutMs: 1400,
-    constellationMaxAlpha: 0.07,
+    clickBurstParticles: 36,
+    clickBurstSpeed: 4.2,
   };
 
   let width = 0;
   let height = 0;
-  let points = [];
-  let edges = []; // {a, b, d} precomputed adjacency, rebuilt occasionally
-  let pulses = []; // traveling signals: {a, b, t, life}
-  let constellations = []; // forming/dissolving polygons between clusters
-  let lastAmbientEvent = 0;
-  let lastConstellationEvent = 0;
-  let lastEdgeRebuild = 0;
+  let particles = [];
+  let anchors = [];
+  let anchorEdges = [];
+  let burstParticles = [];
+  let timeAccum = 0;
 
-  const mouse = { x: null, y: null };
+  const mouse = { x: null, y: null, active: false };
 
   function rand(min, max) {
     return min + Math.random() * (max - min);
   }
 
-  function dist(a, b) {
-    return Math.hypot(a.x - b.x, a.y - b.y);
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  // Cheap multi-octave pseudo-noise flow field: returns an angle in radians
+  // for any (x, y, t). Built from layered sine/cosine rather than true Perlin
+  // noise, since it's far cheaper per-sample and visually similar for this use.
+  function flowAngle(x, y, t) {
+    const a =
+      Math.sin(x * SETTINGS.flowScale + t) * Math.cos(y * SETTINGS.flowScale - t * 0.8) +
+      Math.sin((x + y) * SETTINGS.flowScale2 + t * 1.3) * 0.6;
+    return a * Math.PI * 2;
   }
 
   function resize() {
@@ -86,421 +84,252 @@
     height = window.innerHeight;
     canvas.width = width;
     canvas.height = height;
-    createPoints();
-    rebuildEdges();
+    createParticles();
+    createAnchors();
+    rebuildAnchorEdges();
+
+    // opaque-ish background fill so trail fading works (transparent canvases
+    // can't "fade to black" — they'd fade to see-through, revealing old frames
+    // as the page background shows through instead of darkening smoothly)
+    ctx.fillStyle = "rgba(6, 10, 16, 1)";
+    ctx.fillRect(0, 0, width, height);
   }
 
-  function createPoints() {
-    points = Array.from({ length: SETTINGS.pointCount }, () => {
+  function createParticles() {
+    particles = Array.from({ length: SETTINGS.particleCount }, () => ({
+      x: rand(0, width),
+      y: rand(0, height),
+      speed: rand(SETTINGS.particleSpeedMin, SETTINGS.particleSpeedMax),
+      angle: rand(0, Math.PI * 2),
+    }));
+    burstParticles = [];
+  }
+
+  function createAnchors() {
+    anchors = Array.from({ length: SETTINGS.anchorCount }, () => {
       const homeX = rand(0, width);
       const homeY = rand(0, height);
-
       return {
         homeX,
         homeY,
         x: homeX,
         y: homeY,
-
-        vx: rand(-SETTINGS.driftSpeed, SETTINGS.driftSpeed),
-        vy: rand(-SETTINGS.driftSpeed, SETTINGS.driftSpeed),
-
-        orbitPhase: rand(0, Math.PI * 2),
-        orbitSpeed: rand(SETTINGS.orbitSpeedMin, SETTINGS.orbitSpeedMax),
-        orbitRadius: rand(SETTINGS.orbitRadiusMin, SETTINGS.orbitRadiusMax),
-
-        radius: rand(SETTINGS.pointRadiusMin, SETTINGS.pointRadiusMax),
+        vx: rand(-SETTINGS.anchorDriftSpeed, SETTINGS.anchorDriftSpeed),
+        vy: rand(-SETTINGS.anchorDriftSpeed, SETTINGS.anchorDriftSpeed),
+        radius: rand(SETTINGS.anchorRadiusMin, SETTINGS.anchorRadiusMax),
         pulsePhase: rand(0, Math.PI * 2),
-        pulseSpeed: rand(0.003, 0.007),
-
-        fire: 0, // node "just received a signal" glow
-        mouseGlow: 0, // brightness from cursor proximity (smoothed)
+        glow: 0,
       };
     });
-    pulses = [];
-    constellations = [];
   }
 
-  // Build adjacency list once (and periodically), rather than every frame,
-  // since point positions only drift slightly.
-  function rebuildEdges() {
-    edges = [];
-    const adjacency = points.map(() => []);
-
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i];
+  function rebuildAnchorEdges() {
+    anchorEdges = [];
+    for (let i = 0; i < anchors.length; i++) {
       const candidates = [];
-
-      for (let j = 0; j < points.length; j++) {
+      for (let j = 0; j < anchors.length; j++) {
         if (j === i) continue;
-        const d = dist(p, points[j]);
-        if (d <= SETTINGS.maxDistance) candidates.push({ j, d });
+        const d = Math.hypot(anchors[i].x - anchors[j].x, anchors[i].y - anchors[j].y);
+        if (d <= SETTINGS.anchorMaxDistance) candidates.push({ j, d });
       }
-
       candidates.sort((a, b) => a.d - b.d);
-      candidates.slice(0, SETTINGS.maxLinksPerPoint).forEach((c) => {
-        adjacency[i].push(c.j);
+      candidates.slice(0, SETTINGS.anchorMaxLinks).forEach((c) => {
+        const key = i < c.j ? `${i}-${c.j}` : `${c.j}-${i}`;
+        if (!anchorEdges.some((e) => e.key === key)) {
+          anchorEdges.push({ a: i, b: c.j, key });
+        }
       });
     }
-
-    const seen = new Set();
-    for (let i = 0; i < points.length; i++) {
-      for (const j of adjacency[i]) {
-        const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        edges.push({ a: i, b: j });
-      }
-    }
-
-    // index edges by node for fast lookup when a pulse needs to hop onward
-    const byNode = points.map(() => []);
-    edges.forEach((e, idx) => {
-      byNode[e.a].push(idx);
-      byNode[e.b].push(idx);
-    });
-    edges.byNode = byNode;
   }
 
-  function updatePoints(dt) {
-    const cx = width / 2;
-    const cy = height / 2;
-    const rotStep = SETTINGS.globalRotationSpeed * dt;
-    const cosR = Math.cos(rotStep);
-    const sinR = Math.sin(rotStep);
+  function updateParticles() {
+    const t = timeAccum * SETTINGS.flowTimeSpeed;
 
-    for (const p of points) {
-      // drift (bounces off soft walls)
-      p.homeX += p.vx;
-      p.homeY += p.vy;
+    for (const p of particles) {
+      let angle = flowAngle(p.x, p.y, t);
 
-      if (p.homeX < 20 || p.homeX > width - 20) p.vx *= -1;
-      if (p.homeY < 20 || p.homeY > height - 20) p.vy *= -1;
-
-      // global rotation: rotate home position around canvas center
-      const rx = p.homeX - cx;
-      const ry = p.homeY - cy;
-      p.homeX = cx + rx * cosR - ry * sinR;
-      p.homeY = cy + rx * sinR + ry * cosR;
-
-      // local orbit: small circular loop around the (rotated) home position
-      p.orbitPhase += p.orbitSpeed;
-      const orbitX = Math.cos(p.orbitPhase) * p.orbitRadius;
-      const orbitY = Math.sin(p.orbitPhase) * p.orbitRadius;
-
-      p.pulsePhase += p.pulseSpeed;
-
-      let offsetX = orbitX;
-      let offsetY = orbitY;
-
-      // gentle repel from the cursor, like a probe disturbing the field
-      let proximity = 0;
-      if (mouse.x !== null) {
+      // vortex: near the cursor, bend the flow into a swirl rather than
+      // just following the ambient field
+      if (mouse.active) {
         const dx = p.x - mouse.x;
         const dy = p.y - mouse.y;
         const d = Math.hypot(dx, dy);
-
-        if (d < SETTINGS.mouseRadius && d > 0.001) {
-          const falloff = 1 - d / SETTINGS.mouseRadius;
-          const push = (SETTINGS.mouseRepelStrength * falloff * falloff) / d;
-          offsetX += dx * push;
-          offsetY += dy * push;
-        }
-
-        if (d < SETTINGS.mouseGlowRadius) {
-          proximity = 1 - d / SETTINGS.mouseGlowRadius;
+        if (d < SETTINGS.vortexRadius && d > 0.001) {
+          const swirl = Math.atan2(dy, dx) + Math.PI / 2; // perpendicular = tangential pull
+          const falloff = 1 - d / SETTINGS.vortexRadius;
+          angle = lerp(angle, swirl, falloff * falloff * 0.9);
         }
       }
 
-      p.x = p.homeX + offsetX;
-      p.y = p.homeY + offsetY;
+      p.angle = lerp(p.angle, angle, SETTINGS.flowStrength);
+      p.x += Math.cos(p.angle) * p.speed;
+      p.y += Math.sin(p.angle) * p.speed;
 
-      p.fire *= 0.93;
+      if (p.x < -10) p.x = width + 10;
+      if (p.x > width + 10) p.x = -10;
+      if (p.y < -10) p.y = height + 10;
+      if (p.y > height + 10) p.y = -10;
+    }
 
-      // smooth the glow so it doesn't snap on/off as the cursor moves
-      const targetGlow = proximity * proximity * SETTINGS.mouseGlowStrength;
-      p.mouseGlow += (targetGlow - p.mouseGlow) * 0.18;
+    for (let i = burstParticles.length - 1; i >= 0; i--) {
+      const b = burstParticles[i];
+      b.x += b.vx;
+      b.y += b.vy;
+      b.vx *= 0.96;
+      b.vy *= 0.96;
+      b.life *= 0.96;
+      if (b.life < 0.04) burstParticles.splice(i, 1);
     }
   }
 
-  // Spawn a traveling pulse along a specific edge, in a given direction (a->b)
-  function spawnPulse(edgeIndex, forwardFromA) {
-    const e = edges[edgeIndex];
-    pulses.push({
-      edgeIndex,
-      from: forwardFromA ? e.a : e.b,
-      to: forwardFromA ? e.b : e.a,
-      t: 0,
-      life: 1,
-    });
-  }
+  function updateAnchors() {
+    for (const a of anchors) {
+      a.homeX += a.vx;
+      a.homeY += a.vy;
+      if (a.homeX < 30 || a.homeX > width - 30) a.vx *= -1;
+      if (a.homeY < 30 || a.homeY > height - 30) a.vy *= -1;
 
-  function fireFromNode(nodeIndex, hopsLeft) {
-    points[nodeIndex].fire = 1;
-    if (hopsLeft <= 0) return;
+      a.x = a.homeX;
+      a.y = a.homeY;
+      a.pulsePhase += 0.02;
+      a.glow *= 0.94;
 
-    const candidateEdges = edges.byNode[nodeIndex] || [];
-    if (candidateEdges.length === 0) return;
-
-    // fire along 1-2 random outgoing edges to branch the signal
-    const branchCount = Math.min(candidateEdges.length, Math.random() < 0.5 ? 1 : 2);
-    const shuffled = [...candidateEdges].sort(() => Math.random() - 0.5);
-
-    for (let k = 0; k < branchCount; k++) {
-      const idx = shuffled[k];
-      const e = edges[idx];
-      const forwardFromA = e.a === nodeIndex;
-      spawnPulse(idx, forwardFromA);
-    }
-  }
-
-  function updatePulses() {
-    for (let i = pulses.length - 1; i >= 0; i--) {
-      const pulse = pulses[i];
-      pulse.t += SETTINGS.pulseSpeed;
-
-      if (pulse.t >= 1) {
-        // reached destination node: light it up and maybe continue onward
-        const arrivedAt = pulse.to;
-        points[arrivedAt].fire = Math.max(points[arrivedAt].fire, 1);
-
-        if (pulse.hopsLeft === undefined) pulse.hopsLeft = SETTINGS.ambientHops - 1;
-
-        if (pulse.hopsLeft > 0 && Math.random() < 0.85) {
-          const candidateEdges = (edges.byNode[arrivedAt] || []).filter(
-            (idx) => idx !== pulse.edgeIndex
-          );
-          if (candidateEdges.length > 0) {
-            const idx = candidateEdges[Math.floor(rand(0, candidateEdges.length))];
-            const e = edges[idx];
-            const forwardFromA = e.a === arrivedAt;
-            pulses.push({
-              edgeIndex: idx,
-              from: forwardFromA ? e.a : e.b,
-              to: forwardFromA ? e.b : e.a,
-              t: 0,
-              life: 1,
-              hopsLeft: pulse.hopsLeft - 1,
-            });
-          }
+      if (mouse.active) {
+        const d = Math.hypot(a.x - mouse.x, a.y - mouse.y);
+        if (d < SETTINGS.magnetRadius) {
+          a.glow = Math.max(a.glow, (1 - d / SETTINGS.magnetRadius) * 0.6);
         }
-
-        pulses.splice(i, 1);
-        continue;
       }
     }
   }
 
-  function maybeAmbientEvent(timestamp) {
-    if (timestamp - lastAmbientEvent > SETTINGS.ambientEventEveryMs) {
-      const nodeIndex = Math.floor(rand(0, points.length));
-      fireFromNode(nodeIndex, SETTINGS.ambientHops);
-      lastAmbientEvent = timestamp;
+  function spawnBurst(x, y) {
+    for (let i = 0; i < SETTINGS.clickBurstParticles; i++) {
+      const angle = rand(0, Math.PI * 2);
+      const speed = rand(SETTINGS.clickBurstSpeed * 0.4, SETTINGS.clickBurstSpeed);
+      burstParticles.push({
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+      });
     }
-  }
 
-  // Find a small mutually-close cluster (3-4 nodes) starting from a seed node,
-  // reusing the cached adjacency so this stays cheap.
-  function findCluster(seedIndex) {
-    const neighborIdxs = (edges.byNode[seedIndex] || []).map((edgeIdx) => {
-      const e = edges[edgeIdx];
-      return e.a === seedIndex ? e.b : e.a;
-    });
-
-    if (neighborIdxs.length < 2) return null;
-
-    const shuffled = [...neighborIdxs].sort(() => Math.random() - 0.5);
-    const clusterSize = Math.random() < 0.5 ? 3 : 4;
-    const chosen = [seedIndex, ...shuffled.slice(0, clusterSize - 1)];
-
-    if (chosen.length < 3) return null;
-    return chosen;
-  }
-
-  function maybeConstellationEvent(timestamp) {
-    if (
-      timestamp - lastConstellationEvent > SETTINGS.constellationEveryMs &&
-      constellations.length < SETTINGS.constellationMaxConcurrent
-    ) {
-      const seedIndex = Math.floor(rand(0, points.length));
-      const cluster = findCluster(seedIndex);
-
-      if (cluster) {
-        constellations.push({
-          indices: cluster,
-          startedAt: timestamp,
-        });
-      }
-      lastConstellationEvent = timestamp;
-    }
-  }
-
-  function updateConstellations(timestamp) {
-    const totalLife =
-      SETTINGS.constellationFadeInMs +
-      SETTINGS.constellationHoldMs +
-      SETTINGS.constellationFadeOutMs;
-
-    for (let i = constellations.length - 1; i >= 0; i--) {
-      const c = constellations[i];
-      const age = timestamp - c.startedAt;
-
-      if (age >= totalLife) {
-        constellations.splice(i, 1);
-        continue;
-      }
-
-      if (age < SETTINGS.constellationFadeInMs) {
-        c.alpha = age / SETTINGS.constellationFadeInMs;
-      } else if (age < SETTINGS.constellationFadeInMs + SETTINGS.constellationHoldMs) {
-        c.alpha = 1;
-      } else {
-        const fadeAge = age - SETTINGS.constellationFadeInMs - SETTINGS.constellationHoldMs;
-        c.alpha = 1 - fadeAge / SETTINGS.constellationFadeOutMs;
+    for (const a of anchors) {
+      const d = Math.hypot(a.x - x, a.y - y);
+      if (d < SETTINGS.magnetRadius * 1.3) {
+        a.glow = 1;
       }
     }
   }
 
-  function clickNearestPoint(x, y) {
-    let bestIndex = 0;
-    let bestDistance = Infinity;
+  function drawParticles() {
+    ctx.globalCompositeOperation = "lighter";
+    for (const p of particles) {
+      const speedFrac = (p.speed - SETTINGS.particleSpeedMin) /
+        (SETTINGS.particleSpeedMax - SETTINGS.particleSpeedMin);
+      const color = speedFrac > 0.6 ? SETTINGS.particleColorHot : SETTINGS.particleColorCold;
+      ctx.fillStyle = `rgba(${color}, 0.55)`;
+      ctx.fillRect(p.x, p.y, SETTINGS.particleSize, SETTINGS.particleSize);
+    }
 
-    points.forEach((p, i) => {
-      const d = Math.hypot(p.x - x, p.y - y);
-      if (d < bestDistance) {
-        bestDistance = d;
-        bestIndex = i;
-      }
-    });
-
-    fireFromNode(bestIndex, SETTINGS.ambientHops + 1);
+    for (const b of burstParticles) {
+      ctx.fillStyle = `rgba(${SETTINGS.particleColorHot}, ${b.life * 0.8})`;
+      ctx.fillRect(b.x, b.y, 1.6, 1.6);
+    }
+    ctx.globalCompositeOperation = "source-over";
   }
 
-  function drawConstellations() {
-    for (const c of constellations) {
-      const pts = c.indices.map((idx) => points[idx]).filter(Boolean);
-      if (pts.length < 3) continue;
+  // Draw an anchor-to-anchor connection as a quadratic curve whose control
+  // point gets pulled toward the cursor when the cursor is near the line,
+  // producing the "magnet bending the wire" effect.
+  function drawAnchorEdges() {
+    for (const e of anchorEdges) {
+      const a = anchors[e.a];
+      const b = anchors[e.b];
+      if (!a || !b) continue;
 
-      ctx.fillStyle = `rgba(${SETTINGS.constellationColor}, ${
-        SETTINGS.constellationMaxAlpha * c.alpha
+      const midX = (a.x + b.x) / 2;
+      const midY = (a.y + b.y) / 2;
+
+      let ctrlX = midX;
+      let ctrlY = midY;
+      let bendGlow = 0;
+
+      if (mouse.active) {
+        const d = Math.hypot(midX - mouse.x, midY - mouse.y);
+        if (d < SETTINGS.magnetRadius) {
+          const pull = (1 - d / SETTINGS.magnetRadius);
+          const eased = pull * pull;
+          ctrlX = lerp(midX, mouse.x, eased * 0.85);
+          ctrlY = lerp(midY, mouse.y, eased * 0.85);
+          bendGlow = eased;
+        }
+      }
+
+      const glow = Math.max(a.glow, b.glow, bendGlow * 0.5);
+
+      ctx.strokeStyle = `rgba(${SETTINGS.anchorLineColor}, ${
+        SETTINGS.anchorLineBaseAlpha + glow * 0.5
       })`;
+      ctx.lineWidth = 0.8 + glow * 1.6;
+
       ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (let k = 1; k < pts.length; k++) {
-        ctx.lineTo(pts[k].x, pts[k].y);
-      }
-      ctx.closePath();
-      ctx.fill();
-
-      // faint outline so the shape reads even at low alpha
-      ctx.strokeStyle = `rgba(${SETTINGS.constellationColor}, ${
-        SETTINGS.constellationMaxAlpha * c.alpha * 3.5
-      })`;
-      ctx.lineWidth = 0.8;
+      ctx.moveTo(a.x, a.y);
+      ctx.quadraticCurveTo(ctrlX, ctrlY, b.x, b.y);
       ctx.stroke();
     }
   }
 
-  function drawLines() {
-    for (const e of edges) {
-      const p = points[e.a];
-      const q = points[e.b];
-      const d = dist(p, q);
-      const distanceFactor = 1 - d / SETTINGS.maxDistance;
-      const glow = Math.max(p.fire, q.fire) * 0.18;
+  function drawAnchors() {
+    for (const a of anchors) {
+      const pulse = 0.5 + 0.5 * Math.sin(a.pulsePhase);
+      const alpha = 0.55 + pulse * 0.15 + a.glow * 0.4;
 
-      ctx.strokeStyle = `rgba(${SETTINGS.lineColor}, ${
-        SETTINGS.lineAlpha * distanceFactor + glow
-      })`;
-      ctx.lineWidth = glow > 0.05 ? 1.1 : 0.7;
-
+      ctx.fillStyle = `rgba(${SETTINGS.anchorColor}, ${Math.min(alpha, 1)})`;
       ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-      ctx.lineTo(q.x, q.y);
-      ctx.stroke();
-    }
-  }
-
-  function drawPulses() {
-    for (const pulse of pulses) {
-      const e = edges[pulse.edgeIndex];
-      if (!e) continue;
-      const from = points[pulse.from];
-      const to = points[pulse.to];
-      if (!from || !to) continue;
-
-      const x = from.x + (to.x - from.x) * pulse.t;
-      const y = from.y + (to.y - from.y) * pulse.t;
-
-      // short glowing trail behind the pulse head
-      const trailT = Math.max(0, pulse.t - 0.12);
-      const tx = from.x + (to.x - from.x) * trailT;
-      const ty = from.y + (to.y - from.y) * trailT;
-
-      ctx.strokeStyle = `rgba(${SETTINGS.pulseColor}, ${SETTINGS.pulseTrailAlpha})`;
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      ctx.moveTo(tx, ty);
-      ctx.lineTo(x, y);
-      ctx.stroke();
-
-      // bright head of the signal
-      ctx.fillStyle = `rgba(${SETTINGS.pulseColor}, 0.95)`;
-      ctx.beginPath();
-      ctx.arc(x, y, 2.1, 0, Math.PI * 2);
+      ctx.arc(a.x, a.y, a.radius + a.glow * 2, 0, Math.PI * 2);
       ctx.fill();
 
-      // soft halo
-      ctx.fillStyle = `rgba(${SETTINGS.pulseColor}, 0.12)`;
-      ctx.beginPath();
-      ctx.arc(x, y, 6, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  function drawPoints() {
-    for (const p of points) {
-      const pulse = 0.5 + 0.5 * Math.sin(p.pulsePhase);
-      const glowTotal = p.fire + p.mouseGlow;
-      const alpha = SETTINGS.baseDotAlpha + pulse * 0.08 + Math.min(glowTotal, 1) * 0.5;
-
-      ctx.fillStyle = `rgba(${SETTINGS.dotColor}, ${alpha})`;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.radius + glowTotal * 1.1, 0, Math.PI * 2);
-      ctx.fill();
-
-      if (glowTotal > 0.05) {
-        ctx.fillStyle = `rgba(${SETTINGS.nodeFireColor}, ${Math.min(glowTotal, 1) * 0.10})`;
+      if (a.glow > 0.08) {
+        ctx.fillStyle = `rgba(${SETTINGS.anchorColor}, ${a.glow * 0.18})`;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, (p.radius + 1.5) * 4.2, 0, Math.PI * 2);
+        ctx.arc(a.x, a.y, (a.radius + 2) * 5, 0, Math.PI * 2);
         ctx.fill();
       }
     }
   }
 
-  let lastTimestamp = 0;
+  function drawCursorGlow() {
+    if (!mouse.active) return;
+    const grad = ctx.createRadialGradient(
+      mouse.x, mouse.y, 0,
+      mouse.x, mouse.y, SETTINGS.vortexRadius
+    );
+    grad.addColorStop(0, "rgba(150, 220, 255, 0.05)");
+    grad.addColorStop(1, "rgba(150, 220, 255, 0)");
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(mouse.x, mouse.y, SETTINGS.vortexRadius, 0, Math.PI * 2);
+    ctx.fill();
+  }
 
   function draw(timestamp = 0) {
-    const dt = lastTimestamp ? timestamp - lastTimestamp : 16.7;
-    lastTimestamp = timestamp;
+    timeAccum = timestamp;
 
-    ctx.clearRect(0, 0, width, height);
+    // fade the previous frame slightly instead of clearing fully, so fast
+    // particles leave short glowing trails as they stream through the field
+    ctx.fillStyle = `rgba(6, 10, 16, ${SETTINGS.particleFadeAlpha})`;
+    ctx.fillRect(0, 0, width, height);
 
-    updatePoints(dt);
-    updatePulses();
-    updateConstellations(timestamp);
-    maybeAmbientEvent(timestamp);
-    maybeConstellationEvent(timestamp);
+    updateParticles();
+    updateAnchors();
 
-    // periodically rebuild adjacency since points drift over time
-    if (timestamp - lastEdgeRebuild > 4000) {
-      rebuildEdges();
-      lastEdgeRebuild = timestamp;
-    }
-
-    drawConstellations();
-    drawLines();
-    drawPulses();
-    drawPoints();
+    drawCursorGlow();
+    drawAnchorEdges();
+    drawParticles();
+    drawAnchors();
 
     requestAnimationFrame(draw);
   }
@@ -510,15 +339,15 @@
   window.addEventListener("mousemove", function (e) {
     mouse.x = e.clientX;
     mouse.y = e.clientY;
+    mouse.active = true;
   });
 
   window.addEventListener("mouseleave", function () {
-    mouse.x = null;
-    mouse.y = null;
+    mouse.active = false;
   });
 
   window.addEventListener("click", function (e) {
-    clickNearestPoint(e.clientX, e.clientY);
+    spawnBurst(e.clientX, e.clientY);
   });
 
   resize();
