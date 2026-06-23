@@ -18,7 +18,15 @@
     maxLinksPerPoint: 3,
 
     driftSpeed: 0.018,
-    swayRadius: 6,
+
+    // local orbiting: each point loops in a small circle around its home position
+    orbitRadiusMin: 5,
+    orbitRadiusMax: 14,
+    orbitSpeedMin: 0.004,
+    orbitSpeedMax: 0.012,
+
+    // global rotation: the entire field slowly spins around the canvas center
+    globalRotationSpeed: 0.00006, // radians per ms
 
     pointRadiusMin: 1.1,
     pointRadiusMax: 2.4,
@@ -31,15 +39,26 @@
     lineColor: "110, 170, 210",
     pulseColor: "120, 230, 255",
     nodeFireColor: "180, 240, 255",
+    constellationColor: "140, 200, 255",
 
     ambientEventEveryMs: 1800,
     ambientHops: 3, // how many edges an ambient signal travels
 
-    mouseRadius: 110,
+    mouseRadius: 130,
     mouseRepelStrength: 18, // px of max push at center of radius
+    mouseGlowRadius: 160, // wider than repel radius, so glow announces before the push
+    mouseGlowStrength: 0.85, // max added alpha boost at zero distance
 
     pulseSpeed: 0.045, // fraction of edge length per frame
     pulseTrailAlpha: 0.9,
+
+    // constellation polygons: translucent shapes that form & dissolve between clusters
+    constellationEveryMs: 2600,
+    constellationMaxConcurrent: 3,
+    constellationFadeInMs: 900,
+    constellationHoldMs: 1100,
+    constellationFadeOutMs: 1400,
+    constellationMaxAlpha: 0.07,
   };
 
   let width = 0;
@@ -47,7 +66,9 @@
   let points = [];
   let edges = []; // {a, b, d} precomputed adjacency, rebuilt occasionally
   let pulses = []; // traveling signals: {a, b, t, life}
+  let constellations = []; // forming/dissolving polygons between clusters
   let lastAmbientEvent = 0;
+  let lastConstellationEvent = 0;
   let lastEdgeRebuild = 0;
 
   const mouse = { x: null, y: null };
@@ -83,19 +104,20 @@
         vx: rand(-SETTINGS.driftSpeed, SETTINGS.driftSpeed),
         vy: rand(-SETTINGS.driftSpeed, SETTINGS.driftSpeed),
 
-        swayPhaseX: rand(0, Math.PI * 2),
-        swayPhaseY: rand(0, Math.PI * 2),
-        swaySpeedX: rand(0.0015, 0.0032),
-        swaySpeedY: rand(0.0015, 0.0032),
+        orbitPhase: rand(0, Math.PI * 2),
+        orbitSpeed: rand(SETTINGS.orbitSpeedMin, SETTINGS.orbitSpeedMax),
+        orbitRadius: rand(SETTINGS.orbitRadiusMin, SETTINGS.orbitRadiusMax),
 
         radius: rand(SETTINGS.pointRadiusMin, SETTINGS.pointRadiusMax),
         pulsePhase: rand(0, Math.PI * 2),
         pulseSpeed: rand(0.003, 0.007),
 
         fire: 0, // node "just received a signal" glow
+        mouseGlow: 0, // brightness from cursor proximity (smoothed)
       };
     });
     pulses = [];
+    constellations = [];
   }
 
   // Build adjacency list once (and periodically), rather than every frame,
@@ -139,22 +161,39 @@
     edges.byNode = byNode;
   }
 
-  function updatePoints() {
+  function updatePoints(dt) {
+    const cx = width / 2;
+    const cy = height / 2;
+    const rotStep = SETTINGS.globalRotationSpeed * dt;
+    const cosR = Math.cos(rotStep);
+    const sinR = Math.sin(rotStep);
+
     for (const p of points) {
+      // drift (bounces off soft walls)
       p.homeX += p.vx;
       p.homeY += p.vy;
 
       if (p.homeX < 20 || p.homeX > width - 20) p.vx *= -1;
       if (p.homeY < 20 || p.homeY > height - 20) p.vy *= -1;
 
-      p.swayPhaseX += p.swaySpeedX;
-      p.swayPhaseY += p.swaySpeedY;
+      // global rotation: rotate home position around canvas center
+      const rx = p.homeX - cx;
+      const ry = p.homeY - cy;
+      p.homeX = cx + rx * cosR - ry * sinR;
+      p.homeY = cy + rx * sinR + ry * cosR;
+
+      // local orbit: small circular loop around the (rotated) home position
+      p.orbitPhase += p.orbitSpeed;
+      const orbitX = Math.cos(p.orbitPhase) * p.orbitRadius;
+      const orbitY = Math.sin(p.orbitPhase) * p.orbitRadius;
+
       p.pulsePhase += p.pulseSpeed;
 
-      let offsetX = Math.sin(p.swayPhaseX) * SETTINGS.swayRadius;
-      let offsetY = Math.cos(p.swayPhaseY) * SETTINGS.swayRadius;
+      let offsetX = orbitX;
+      let offsetY = orbitY;
 
       // gentle repel from the cursor, like a probe disturbing the field
+      let proximity = 0;
       if (mouse.x !== null) {
         const dx = p.x - mouse.x;
         const dy = p.y - mouse.y;
@@ -166,12 +205,20 @@
           offsetX += dx * push;
           offsetY += dy * push;
         }
+
+        if (d < SETTINGS.mouseGlowRadius) {
+          proximity = 1 - d / SETTINGS.mouseGlowRadius;
+        }
       }
 
       p.x = p.homeX + offsetX;
       p.y = p.homeY + offsetY;
 
       p.fire *= 0.93;
+
+      // smooth the glow so it doesn't snap on/off as the cursor moves
+      const targetGlow = proximity * proximity * SETTINGS.mouseGlowStrength;
+      p.mouseGlow += (targetGlow - p.mouseGlow) * 0.18;
     }
   }
 
@@ -251,6 +298,68 @@
     }
   }
 
+  // Find a small mutually-close cluster (3-4 nodes) starting from a seed node,
+  // reusing the cached adjacency so this stays cheap.
+  function findCluster(seedIndex) {
+    const neighborIdxs = (edges.byNode[seedIndex] || []).map((edgeIdx) => {
+      const e = edges[edgeIdx];
+      return e.a === seedIndex ? e.b : e.a;
+    });
+
+    if (neighborIdxs.length < 2) return null;
+
+    const shuffled = [...neighborIdxs].sort(() => Math.random() - 0.5);
+    const clusterSize = Math.random() < 0.5 ? 3 : 4;
+    const chosen = [seedIndex, ...shuffled.slice(0, clusterSize - 1)];
+
+    if (chosen.length < 3) return null;
+    return chosen;
+  }
+
+  function maybeConstellationEvent(timestamp) {
+    if (
+      timestamp - lastConstellationEvent > SETTINGS.constellationEveryMs &&
+      constellations.length < SETTINGS.constellationMaxConcurrent
+    ) {
+      const seedIndex = Math.floor(rand(0, points.length));
+      const cluster = findCluster(seedIndex);
+
+      if (cluster) {
+        constellations.push({
+          indices: cluster,
+          startedAt: timestamp,
+        });
+      }
+      lastConstellationEvent = timestamp;
+    }
+  }
+
+  function updateConstellations(timestamp) {
+    const totalLife =
+      SETTINGS.constellationFadeInMs +
+      SETTINGS.constellationHoldMs +
+      SETTINGS.constellationFadeOutMs;
+
+    for (let i = constellations.length - 1; i >= 0; i--) {
+      const c = constellations[i];
+      const age = timestamp - c.startedAt;
+
+      if (age >= totalLife) {
+        constellations.splice(i, 1);
+        continue;
+      }
+
+      if (age < SETTINGS.constellationFadeInMs) {
+        c.alpha = age / SETTINGS.constellationFadeInMs;
+      } else if (age < SETTINGS.constellationFadeInMs + SETTINGS.constellationHoldMs) {
+        c.alpha = 1;
+      } else {
+        const fadeAge = age - SETTINGS.constellationFadeInMs - SETTINGS.constellationHoldMs;
+        c.alpha = 1 - fadeAge / SETTINGS.constellationFadeOutMs;
+      }
+    }
+  }
+
   function clickNearestPoint(x, y) {
     let bestIndex = 0;
     let bestDistance = Infinity;
@@ -264,6 +373,31 @@
     });
 
     fireFromNode(bestIndex, SETTINGS.ambientHops + 1);
+  }
+
+  function drawConstellations() {
+    for (const c of constellations) {
+      const pts = c.indices.map((idx) => points[idx]).filter(Boolean);
+      if (pts.length < 3) continue;
+
+      ctx.fillStyle = `rgba(${SETTINGS.constellationColor}, ${
+        SETTINGS.constellationMaxAlpha * c.alpha
+      })`;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let k = 1; k < pts.length; k++) {
+        ctx.lineTo(pts[k].x, pts[k].y);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      // faint outline so the shape reads even at low alpha
+      ctx.strokeStyle = `rgba(${SETTINGS.constellationColor}, ${
+        SETTINGS.constellationMaxAlpha * c.alpha * 3.5
+      })`;
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+    }
   }
 
   function drawLines() {
@@ -326,15 +460,16 @@
   function drawPoints() {
     for (const p of points) {
       const pulse = 0.5 + 0.5 * Math.sin(p.pulsePhase);
-      const alpha = SETTINGS.baseDotAlpha + pulse * 0.08 + p.fire * 0.5;
+      const glowTotal = p.fire + p.mouseGlow;
+      const alpha = SETTINGS.baseDotAlpha + pulse * 0.08 + Math.min(glowTotal, 1) * 0.5;
 
       ctx.fillStyle = `rgba(${SETTINGS.dotColor}, ${alpha})`;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.radius + p.fire * 1.1, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, p.radius + glowTotal * 1.1, 0, Math.PI * 2);
       ctx.fill();
 
-      if (p.fire > 0.05) {
-        ctx.fillStyle = `rgba(${SETTINGS.nodeFireColor}, ${p.fire * 0.10})`;
+      if (glowTotal > 0.05) {
+        ctx.fillStyle = `rgba(${SETTINGS.nodeFireColor}, ${Math.min(glowTotal, 1) * 0.10})`;
         ctx.beginPath();
         ctx.arc(p.x, p.y, (p.radius + 1.5) * 4.2, 0, Math.PI * 2);
         ctx.fill();
@@ -342,12 +477,19 @@
     }
   }
 
+  let lastTimestamp = 0;
+
   function draw(timestamp = 0) {
+    const dt = lastTimestamp ? timestamp - lastTimestamp : 16.7;
+    lastTimestamp = timestamp;
+
     ctx.clearRect(0, 0, width, height);
 
-    updatePoints();
+    updatePoints(dt);
     updatePulses();
+    updateConstellations(timestamp);
     maybeAmbientEvent(timestamp);
+    maybeConstellationEvent(timestamp);
 
     // periodically rebuild adjacency since points drift over time
     if (timestamp - lastEdgeRebuild > 4000) {
@@ -355,6 +497,7 @@
       lastEdgeRebuild = timestamp;
     }
 
+    drawConstellations();
     drawLines();
     drawPulses();
     drawPoints();
