@@ -1,35 +1,54 @@
 (function () {
   const canvas = document.createElement("canvas");
   canvas.id = "neural-background";
+  canvas.style.position = "fixed";
+  canvas.style.top = "0";
+  canvas.style.left = "0";
+  canvas.style.width = "100%";
+  canvas.style.height = "100%";
+  canvas.style.zIndex = "-1";
+  canvas.style.pointerEvents = "none";
   document.body.prepend(canvas);
 
   const ctx = canvas.getContext("2d");
 
   const SETTINGS = {
-    pointCount: 58,
-    maxDistance: 135,
+    pointCount: 65,
+    maxDistance: 140,
     maxLinksPerPoint: 3,
 
     driftSpeed: 0.018,
     swayRadius: 6,
 
-    pointRadiusMin: 1.0,
-    pointRadiusMax: 2.1,
+    pointRadiusMin: 1.1,
+    pointRadiusMax: 2.4,
 
-    baseDotAlpha: 0.34,
-    glowDotAlpha: 0.78,
+    baseDotAlpha: 0.32,
     lineAlpha: 0.10,
-    shapeAlpha: 0.035,
 
-    ambientEventEveryMs: 2200,
-    mouseRadius: 85,
+    // electrical-signal palette (cool blue/cyan)
+    dotColor: "150, 210, 255",
+    lineColor: "110, 170, 210",
+    pulseColor: "120, 230, 255",
+    nodeFireColor: "180, 240, 255",
+
+    ambientEventEveryMs: 1800,
+    ambientHops: 3, // how many edges an ambient signal travels
+
+    mouseRadius: 110,
+    mouseRepelStrength: 18, // px of max push at center of radius
+
+    pulseSpeed: 0.045, // fraction of edge length per frame
+    pulseTrailAlpha: 0.9,
   };
 
   let width = 0;
   let height = 0;
   let points = [];
-  let clusters = [];
+  let edges = []; // {a, b, d} precomputed adjacency, rebuilt occasionally
+  let pulses = []; // traveling signals: {a, b, t, life}
   let lastAmbientEvent = 0;
+  let lastEdgeRebuild = 0;
 
   const mouse = { x: null, y: null };
 
@@ -47,6 +66,7 @@
     canvas.width = width;
     canvas.height = height;
     createPoints();
+    rebuildEdges();
   }
 
   function createPoints() {
@@ -72,11 +92,51 @@
         pulsePhase: rand(0, Math.PI * 2),
         pulseSpeed: rand(0.003, 0.007),
 
-        glow: 0,
+        fire: 0, // node "just received a signal" glow
       };
     });
+    pulses = [];
+  }
 
-    clusters = [];
+  // Build adjacency list once (and periodically), rather than every frame,
+  // since point positions only drift slightly.
+  function rebuildEdges() {
+    edges = [];
+    const adjacency = points.map(() => []);
+
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      const candidates = [];
+
+      for (let j = 0; j < points.length; j++) {
+        if (j === i) continue;
+        const d = dist(p, points[j]);
+        if (d <= SETTINGS.maxDistance) candidates.push({ j, d });
+      }
+
+      candidates.sort((a, b) => a.d - b.d);
+      candidates.slice(0, SETTINGS.maxLinksPerPoint).forEach((c) => {
+        adjacency[i].push(c.j);
+      });
+    }
+
+    const seen = new Set();
+    for (let i = 0; i < points.length; i++) {
+      for (const j of adjacency[i]) {
+        const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({ a: i, b: j });
+      }
+    }
+
+    // index edges by node for fast lookup when a pulse needs to hop onward
+    const byNode = points.map(() => []);
+    edges.forEach((e, idx) => {
+      byNode[e.a].push(idx);
+      byNode[e.b].push(idx);
+    });
+    edges.byNode = byNode;
   }
 
   function updatePoints() {
@@ -94,73 +154,99 @@
       let offsetX = Math.sin(p.swayPhaseX) * SETTINGS.swayRadius;
       let offsetY = Math.cos(p.swayPhaseY) * SETTINGS.swayRadius;
 
+      // gentle repel from the cursor, like a probe disturbing the field
       if (mouse.x !== null) {
         const dx = p.x - mouse.x;
         const dy = p.y - mouse.y;
         const d = Math.hypot(dx, dy);
 
-        if (d < SETTINGS.mouseRadius && d > 0) {
-          offsetX += dx / 60;
-          offsetY += dy / 60;
+        if (d < SETTINGS.mouseRadius && d > 0.001) {
+          const falloff = 1 - d / SETTINGS.mouseRadius;
+          const push = (SETTINGS.mouseRepelStrength * falloff * falloff) / d;
+          offsetX += dx * push;
+          offsetY += dy * push;
         }
       }
 
       p.x = p.homeX + offsetX;
       p.y = p.homeY + offsetY;
 
-      p.glow *= 0.965;
+      p.fire *= 0.93;
     }
   }
 
-  function getNeighbors(index) {
-    const p = points[index];
-    const neighbors = [];
-
-    for (let j = 0; j < points.length; j++) {
-      if (j === index) continue;
-
-      const q = points[j];
-      const d = dist(p, q);
-
-      if (d <= SETTINGS.maxDistance) {
-        neighbors.push({ index: j, d });
-      }
-    }
-
-    neighbors.sort((a, b) => a.d - b.d);
-    return neighbors.slice(0, SETTINGS.maxLinksPerPoint);
-  }
-
-  function triggerAmbientCluster() {
-    const index = Math.floor(rand(0, points.length));
-    const center = points[index];
-    const neighbors = getNeighbors(index);
-
-    center.glow = 1;
-
-    const linked = [index, ...neighbors.slice(0, 2).map((n) => n.index)];
-    linked.forEach((i) => {
-      if (points[i]) points[i].glow = Math.max(points[i].glow, 0.65);
-    });
-
-    clusters.push({
-      indices: linked,
+  // Spawn a traveling pulse along a specific edge, in a given direction (a->b)
+  function spawnPulse(edgeIndex, forwardFromA) {
+    const e = edges[edgeIndex];
+    pulses.push({
+      edgeIndex,
+      from: forwardFromA ? e.a : e.b,
+      to: forwardFromA ? e.b : e.a,
+      t: 0,
       life: 1,
     });
   }
 
-  function updateClusters() {
-    for (let i = clusters.length - 1; i >= 0; i--) {
-      clusters[i].life *= 0.96;
-      if (clusters[i].life < 0.04) {
-        clusters.splice(i, 1);
+  function fireFromNode(nodeIndex, hopsLeft) {
+    points[nodeIndex].fire = 1;
+    if (hopsLeft <= 0) return;
+
+    const candidateEdges = edges.byNode[nodeIndex] || [];
+    if (candidateEdges.length === 0) return;
+
+    // fire along 1-2 random outgoing edges to branch the signal
+    const branchCount = Math.min(candidateEdges.length, Math.random() < 0.5 ? 1 : 2);
+    const shuffled = [...candidateEdges].sort(() => Math.random() - 0.5);
+
+    for (let k = 0; k < branchCount; k++) {
+      const idx = shuffled[k];
+      const e = edges[idx];
+      const forwardFromA = e.a === nodeIndex;
+      spawnPulse(idx, forwardFromA);
+    }
+  }
+
+  function updatePulses() {
+    for (let i = pulses.length - 1; i >= 0; i--) {
+      const pulse = pulses[i];
+      pulse.t += SETTINGS.pulseSpeed;
+
+      if (pulse.t >= 1) {
+        // reached destination node: light it up and maybe continue onward
+        const arrivedAt = pulse.to;
+        points[arrivedAt].fire = Math.max(points[arrivedAt].fire, 1);
+
+        if (pulse.hopsLeft === undefined) pulse.hopsLeft = SETTINGS.ambientHops - 1;
+
+        if (pulse.hopsLeft > 0 && Math.random() < 0.85) {
+          const candidateEdges = (edges.byNode[arrivedAt] || []).filter(
+            (idx) => idx !== pulse.edgeIndex
+          );
+          if (candidateEdges.length > 0) {
+            const idx = candidateEdges[Math.floor(rand(0, candidateEdges.length))];
+            const e = edges[idx];
+            const forwardFromA = e.a === arrivedAt;
+            pulses.push({
+              edgeIndex: idx,
+              from: forwardFromA ? e.a : e.b,
+              to: forwardFromA ? e.b : e.a,
+              t: 0,
+              life: 1,
+              hopsLeft: pulse.hopsLeft - 1,
+            });
+          }
+        }
+
+        pulses.splice(i, 1);
+        continue;
       }
     }
   }
 
   function maybeAmbientEvent(timestamp) {
     if (timestamp - lastAmbientEvent > SETTINGS.ambientEventEveryMs) {
-      triggerAmbientCluster();
+      const nodeIndex = Math.floor(rand(0, points.length));
+      fireFromNode(nodeIndex, SETTINGS.ambientHops);
       lastAmbientEvent = timestamp;
     }
   }
@@ -177,78 +263,80 @@
       }
     });
 
-    const neighbors = getNeighbors(bestIndex);
-    const linked = [bestIndex, ...neighbors.slice(0, 3).map((n) => n.index)];
-
-    linked.forEach((i) => {
-      if (points[i]) points[i].glow = 1;
-    });
-
-    clusters.push({
-      indices: linked,
-      life: 1,
-    });
-  }
-
-  function drawShapes() {
-    for (const cluster of clusters) {
-      if (cluster.indices.length < 3) continue;
-
-      const a = points[cluster.indices[0]];
-      const b = points[cluster.indices[1]];
-      const c = points[cluster.indices[2]];
-      if (!a || !b || !c) continue;
-
-      ctx.fillStyle = `rgba(170, 182, 190, ${SETTINGS.shapeAlpha * cluster.life})`;
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
-      ctx.lineTo(c.x, c.y);
-      ctx.closePath();
-      ctx.fill();
-    }
+    fireFromNode(bestIndex, SETTINGS.ambientHops + 1);
   }
 
   function drawLines() {
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i];
-      const neighbors = getNeighbors(i);
+    for (const e of edges) {
+      const p = points[e.a];
+      const q = points[e.b];
+      const d = dist(p, q);
+      const distanceFactor = 1 - d / SETTINGS.maxDistance;
+      const glow = Math.max(p.fire, q.fire) * 0.18;
 
-      for (const n of neighbors) {
-        const j = n.index;
-        if (j <= i) continue;
+      ctx.strokeStyle = `rgba(${SETTINGS.lineColor}, ${
+        SETTINGS.lineAlpha * distanceFactor + glow
+      })`;
+      ctx.lineWidth = glow > 0.05 ? 1.1 : 0.7;
 
-        const q = points[j];
-        const distanceFactor = 1 - n.d / SETTINGS.maxDistance;
-        const glow = Math.max(p.glow, q.glow);
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(q.x, q.y);
+      ctx.stroke();
+    }
+  }
 
-        ctx.strokeStyle = `rgba(150, 164, 172, ${
-          SETTINGS.lineAlpha * distanceFactor + glow * 0.12
-        })`;
-        ctx.lineWidth = glow > 0.2 ? 1.0 : 0.7;
+  function drawPulses() {
+    for (const pulse of pulses) {
+      const e = edges[pulse.edgeIndex];
+      if (!e) continue;
+      const from = points[pulse.from];
+      const to = points[pulse.to];
+      if (!from || !to) continue;
 
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y);
-        ctx.lineTo(q.x, q.y);
-        ctx.stroke();
-      }
+      const x = from.x + (to.x - from.x) * pulse.t;
+      const y = from.y + (to.y - from.y) * pulse.t;
+
+      // short glowing trail behind the pulse head
+      const trailT = Math.max(0, pulse.t - 0.12);
+      const tx = from.x + (to.x - from.x) * trailT;
+      const ty = from.y + (to.y - from.y) * trailT;
+
+      ctx.strokeStyle = `rgba(${SETTINGS.pulseColor}, ${SETTINGS.pulseTrailAlpha})`;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(tx, ty);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+
+      // bright head of the signal
+      ctx.fillStyle = `rgba(${SETTINGS.pulseColor}, 0.95)`;
+      ctx.beginPath();
+      ctx.arc(x, y, 2.1, 0, Math.PI * 2);
+      ctx.fill();
+
+      // soft halo
+      ctx.fillStyle = `rgba(${SETTINGS.pulseColor}, 0.12)`;
+      ctx.beginPath();
+      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
   function drawPoints() {
     for (const p of points) {
       const pulse = 0.5 + 0.5 * Math.sin(p.pulsePhase);
-      const alpha = SETTINGS.baseDotAlpha + pulse * 0.08 + p.glow * 0.35;
+      const alpha = SETTINGS.baseDotAlpha + pulse * 0.08 + p.fire * 0.5;
 
-      ctx.fillStyle = `rgba(220, 226, 230, ${alpha})`;
+      ctx.fillStyle = `rgba(${SETTINGS.dotColor}, ${alpha})`;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.radius + p.glow * 0.8, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, p.radius + p.fire * 1.1, 0, Math.PI * 2);
       ctx.fill();
 
-      if (p.glow > 0.06) {
-        ctx.fillStyle = `rgba(220, 226, 230, ${p.glow * 0.08})`;
+      if (p.fire > 0.05) {
+        ctx.fillStyle = `rgba(${SETTINGS.nodeFireColor}, ${p.fire * 0.10})`;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, (p.radius + 1.5) * 3.8, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, (p.radius + 1.5) * 4.2, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -258,11 +346,17 @@
     ctx.clearRect(0, 0, width, height);
 
     updatePoints();
-    updateClusters();
+    updatePulses();
     maybeAmbientEvent(timestamp);
 
-    drawShapes();
+    // periodically rebuild adjacency since points drift over time
+    if (timestamp - lastEdgeRebuild > 4000) {
+      rebuildEdges();
+      lastEdgeRebuild = timestamp;
+    }
+
     drawLines();
+    drawPulses();
     drawPoints();
 
     requestAnimationFrame(draw);
