@@ -6,26 +6,26 @@
   const ctx = canvas.getContext("2d");
 
   const SETTINGS = {
-    neuronCount: 78,
-    maxConnectionDistance: 260,
+    neuronCount: 68,
+    maxConnectionDistance: 235,
     minConnections: 2,
     maxConnections: 4,
 
-    driftSpeed: 0.045,
-    swayAmount: 0.22,
-
-    ambientFireEveryMs: 1200,
+    ambientFireEveryMs: 1700,
     maxPropagationDepth: 2,
 
-    signalSpeedMin: 0.012,
-    signalSpeedMax: 0.02,
+    signalSpeedMin: 0.01,
+    signalSpeedMax: 0.018,
 
     dendriteCountMin: 5,
     dendriteCountMax: 8,
-    dendriteLengthMin: 30,
-    dendriteLengthMax: 62,
+    dendriteLengthMin: 28,
+    dendriteLengthMax: 56,
 
-    connectionRefreshFrames: 180,
+    connectionRefreshFrames: 260,
+
+    homeDriftSpeed: 0.018,
+    swayRadius: 6,
   };
 
   let width;
@@ -59,8 +59,8 @@
       const length =
         SETTINGS.dendriteLengthMin +
         Math.random() * (SETTINGS.dendriteLengthMax - SETTINGS.dendriteLengthMin);
-      const branchAngle = angle + (Math.random() > 0.5 ? 0.55 : -0.55);
-      const branchLength = 10 + Math.random() * 18;
+      const branchAngle = angle + (Math.random() > 0.5 ? 0.5 : -0.5);
+      const branchLength = 10 + Math.random() * 16;
 
       return {
         angle,
@@ -70,17 +70,25 @@
       };
     });
 
-    return {
-      x: x ?? Math.random() * width,
-      y: y ?? Math.random() * height,
-      vx: (Math.random() - 0.5) * SETTINGS.driftSpeed,
-      vy: (Math.random() - 0.5) * SETTINGS.driftSpeed,
-      radius: 3.5 + Math.random() * 2.2,
+    const homeX = x ?? Math.random() * width;
+    const homeY = y ?? Math.random() * height;
 
-      phase: Math.random() * Math.PI * 2,
+    return {
+      homeX,
+      homeY,
+      x: homeX,
+      y: homeY,
+
+      homeVX: (Math.random() - 0.5) * SETTINGS.homeDriftSpeed,
+      homeVY: (Math.random() - 0.5) * SETTINGS.homeDriftSpeed,
+
       swayPhaseX: Math.random() * Math.PI * 2,
       swayPhaseY: Math.random() * Math.PI * 2,
+      swaySpeedX: 0.003 + Math.random() * 0.002,
+      swaySpeedY: 0.003 + Math.random() * 0.002,
 
+      radius: 3.4 + Math.random() * 2.0,
+      phase: Math.random() * Math.PI * 2,
       flash: 0,
       cooldown: 0,
 
@@ -134,17 +142,15 @@
         if (!used.has(key)) {
           used.add(key);
 
-          const curveSeed = (((i * 37 + j * 19) % 100) / 100 - 0.5) * 28;
-
-          const edge = {
+          edges.push({
             i,
             j,
-            curve: curveSeed,
+            curve: (((i * 31 + j * 17) % 100) / 100 - 0.5) * 34,
+            bendPhase: Math.random() * Math.PI * 2,
             glow: 0,
-          };
+          });
 
-          edges.push(edge);
-          edgeMap[key] = edge;
+          edgeMap[key] = edges[edges.length - 1];
         }
 
         if (!neurons[i].neighbors.includes(j)) neurons[i].neighbors.push(j);
@@ -167,9 +173,11 @@
     const nx = -dy / len;
     const ny = dx / len;
 
+    const breathe = Math.sin(edge.bendPhase) * 6;
+
     return {
-      x: mx + nx * edge.curve,
-      y: my + ny * edge.curve,
+      x: mx + nx * (edge.curve + breathe),
+      y: my + ny * (edge.curve + breathe),
     };
   }
 
@@ -179,6 +187,22 @@
       x: mt * mt * p0.x + 2 * mt * t * p1.x + t * t * p2.x,
       y: mt * mt * p0.y + 2 * mt * t * p1.y + t * t * p2.y,
     };
+  }
+
+  function drawCurveSegment(a, c, b, t0, t1, steps, color, width) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+
+    for (let i = 0; i <= steps; i++) {
+      const t = t0 + (t1 - t0) * (i / steps);
+      const p = quadraticPoint(a, c, b, t);
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+
+    ctx.stroke();
   }
 
   function fireNeuron(index, depth = 0, fromIndex = null) {
@@ -199,7 +223,7 @@
         from: index,
         to: targetIndex,
         t: 0,
-        delay: order * 6 + Math.random() * 10,
+        delay: order * 8 + Math.random() * 12,
         speed:
           SETTINGS.signalSpeedMin +
           Math.random() * (SETTINGS.signalSpeedMax - SETTINGS.signalSpeedMin),
@@ -225,33 +249,37 @@
 
   function updateNeurons() {
     for (const n of neurons) {
-      n.phase += 0.012;
-      n.swayPhaseX += 0.004 + Math.random() * 0.001;
-      n.swayPhaseY += 0.0035 + Math.random() * 0.001;
+      n.phase += 0.01;
+      n.swayPhaseX += n.swaySpeedX;
+      n.swayPhaseY += n.swaySpeedY;
 
-      n.x += n.vx + Math.sin(n.swayPhaseX) * SETTINGS.swayAmount * 0.05;
-      n.y += n.vy + Math.cos(n.swayPhaseY) * SETTINGS.swayAmount * 0.05;
+      n.homeX += n.homeVX;
+      n.homeY += n.homeVY;
 
-      n.flash *= 0.95;
-      n.cooldown *= 0.97;
-
-      if (n.x < -70 || n.x > width + 70) n.vx *= -1;
-      if (n.y < -70 || n.y > height + 70) n.vy *= -1;
+      if (n.homeX < 40 || n.homeX > width - 40) n.homeVX *= -1;
+      if (n.homeY < 40 || n.homeY > height - 40) n.homeVY *= -1;
 
       if (mouse.x !== null) {
-        const dx = n.x - mouse.x;
-        const dy = n.y - mouse.y;
+        const dx = n.homeX - mouse.x;
+        const dy = n.homeY - mouse.y;
         const d = Math.hypot(dx, dy);
 
         if (d < 120 && d > 0) {
-          n.x += dx / 140;
-          n.y += dy / 140;
+          n.homeX += dx / 180;
+          n.homeY += dy / 180;
         }
       }
+
+      n.x = n.homeX + Math.sin(n.swayPhaseX) * SETTINGS.swayRadius;
+      n.y = n.homeY + Math.cos(n.swayPhaseY) * SETTINGS.swayRadius;
+
+      n.flash *= 0.95;
+      n.cooldown *= 0.97;
     }
 
     for (const edge of edges) {
-      edge.glow *= 0.92;
+      edge.glow *= 0.93;
+      edge.bendPhase += 0.004;
     }
   }
 
@@ -267,7 +295,7 @@
       s.t += s.speed;
 
       const edge = edgeMap[pairKey(s.from, s.to)];
-      if (edge) edge.glow = Math.max(edge.glow, 0.9);
+      if (edge) edge.glow = Math.max(edge.glow, 0.75);
 
       if (s.t >= 1) {
         fireNeuron(s.to, s.depth, s.from);
@@ -283,22 +311,26 @@
       const c = getControlPoint(edge);
 
       const d = dist(a, b);
-      const alpha = Math.max(0.04, 1 - d / SETTINGS.maxConnectionDistance) * 0.13;
+      const alpha = Math.max(0.03, 1 - d / SETTINGS.maxConnectionDistance) * 0.09;
 
-      ctx.strokeStyle = `rgba(70, 170, 205, ${alpha})`;
-      ctx.lineWidth = 0.8;
+      ctx.strokeStyle = `rgba(115, 155, 170, ${alpha})`;
+      ctx.lineWidth = 0.75;
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.quadraticCurveTo(c.x, c.y, b.x, b.y);
       ctx.stroke();
 
       if (edge.glow > 0.02) {
-        ctx.strokeStyle = `rgba(165, 240, 255, ${edge.glow * 0.28})`;
-        ctx.lineWidth = 1.6;
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.quadraticCurveTo(c.x, c.y, b.x, b.y);
-        ctx.stroke();
+        drawCurveSegment(
+          a,
+          c,
+          b,
+          0,
+          1,
+          18,
+          `rgba(175, 215, 225, ${edge.glow * 0.16})`,
+          1.2
+        );
       }
     }
   }
@@ -315,18 +347,18 @@
       const c = getControlPoint(edge);
 
       const headT = Math.min(1, s.t);
-      const tailT = Math.max(0, s.t - 0.16);
+      const tailT = Math.max(0, s.t - 0.14);
 
-      const head = quadraticPoint(a, c, b, headT);
-      const tail = quadraticPoint(a, c, b, tailT);
-
-      ctx.strokeStyle = "rgba(190, 250, 255, 0.72)";
-      ctx.lineWidth = 2.0;
-      ctx.lineCap = "round";
-      ctx.beginPath();
-      ctx.moveTo(tail.x, tail.y);
-      ctx.lineTo(head.x, head.y);
-      ctx.stroke();
+      drawCurveSegment(
+        a,
+        c,
+        b,
+        tailT,
+        headT,
+        10,
+        "rgba(210, 230, 235, 0.42)",
+        1.6
+      );
     }
   }
 
@@ -342,8 +374,8 @@
       const xb = x2 + Math.cos(d.branchAngle) * d.branchLength;
       const yb = y2 + Math.sin(d.branchAngle) * d.branchLength;
 
-      ctx.strokeStyle = `rgba(95, 205, 230, ${0.10 + baseGlow * 0.05 + active * 0.35})`;
-      ctx.lineWidth = 0.85 + active * 0.5;
+      ctx.strokeStyle = `rgba(120, 165, 178, ${0.08 + baseGlow * 0.03 + active * 0.22})`;
+      ctx.lineWidth = 0.8 + active * 0.35;
       ctx.lineCap = "round";
 
       ctx.beginPath();
@@ -353,14 +385,14 @@
       ctx.stroke();
     }
 
-    ctx.fillStyle = `rgba(125, 230, 245, ${0.26 + baseGlow * 0.15 + active * 0.22})`;
+    ctx.fillStyle = `rgba(145, 185, 195, ${0.18 + baseGlow * 0.06 + active * 0.14})`;
     ctx.beginPath();
-    ctx.arc(n.x, n.y, n.radius + baseGlow * 0.35 + active * 0.5, 0, Math.PI * 2);
+    ctx.arc(n.x, n.y, n.radius + baseGlow * 0.22 + active * 0.35, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.fillStyle = `rgba(220, 255, 255, ${0.18 + active * 0.25})`;
+    ctx.fillStyle = `rgba(220, 235, 238, ${0.08 + active * 0.16})`;
     ctx.beginPath();
-    ctx.arc(n.x, n.y, n.radius * 0.28, 0, Math.PI * 2);
+    ctx.arc(n.x, n.y, n.radius * 0.26, 0, Math.PI * 2);
     ctx.fill();
   }
 
