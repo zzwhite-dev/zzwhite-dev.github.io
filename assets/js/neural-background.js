@@ -6,26 +6,21 @@
   const ctx = canvas.getContext("2d");
 
   const SETTINGS = {
-    neuronCount: 54,
-    maxConnectionDistance: 240,
-    minConnections: 1,
-    maxConnections: 3,
+    neuronCount: 28,
+    maxTargetsPerNeuron: 2,
+    maxConnectionDistance: 340,
 
-    ambientFireEveryMs: 1900,
+    ambientFireEveryMs: 1800,
     maxPropagationDepth: 2,
 
-    signalSpeedMin: 0.008,
-    signalSpeedMax: 0.015,
+    signalSpeedMin: 0.005,
+    signalSpeedMax: 0.010,
+    signalTailLength: 0.26,
 
-    dendriteCountMin: 6,
-    dendriteCountMax: 10,
-    dendriteLengthMin: 18,
-    dendriteLengthMax: 42,
+    homeDriftSpeed: 0.006,
+    swayRadius: 5.5,
 
-    homeDriftSpeed: 0.01,
-    swayRadius: 4.5,
-
-    connectionRefreshFrames: 320,
+    connectionRefreshFrames: 420,
   };
 
   let width;
@@ -38,67 +33,77 @@
 
   const mouse = { x: null, y: null };
 
-  function resize() {
-    width = window.innerWidth;
-    height = window.innerHeight;
-    canvas.width = width;
-    canvas.height = height;
-
-    neurons = Array.from({ length: SETTINGS.neuronCount }, () => createNeuron());
-    buildConnections();
-  }
-
   function rand(min, max) {
     return min + Math.random() * (max - min);
-  }
-
-  function dist(a, b) {
-    return Math.hypot(a.x - b.x, a.y - b.y);
   }
 
   function lerp(a, b, t) {
     return a + (b - a) * t;
   }
 
-  function pointLerp(p1, p2, t) {
+  function dist(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+
+  function pointLerp(a, b, t) {
     return {
-      x: lerp(p1.x, p2.x, t),
-      y: lerp(p1.y, p2.y, t),
+      x: lerp(a.x, b.x, t),
+      y: lerp(a.y, b.y, t),
     };
   }
 
+  function angleWrap(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+
+  function resize() {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = width;
+    canvas.height = height;
+
+    buildScene();
+  }
+
+  function buildScene() {
+    neurons = Array.from({ length: SETTINGS.neuronCount }, () => createNeuron());
+    buildEdges();
+  }
+
   function createNeuron(x, y) {
-    const homeX = x ?? rand(0, width);
-    const homeY = y ?? rand(0, height);
+    const homeX = x ?? rand(60, width - 60);
+    const homeY = y ?? rand(60, height - 60);
 
-    const baseRadius = rand(10, 16);
-
-    const dendriteCount =
-      SETTINGS.dendriteCountMin +
-      Math.floor(Math.random() * (SETTINGS.dendriteCountMax - SETTINGS.dendriteCountMin + 1));
-
-    const dendrites = Array.from({ length: dendriteCount }, () => {
-      const angle = rand(0, Math.PI * 2);
-      const length = rand(SETTINGS.dendriteLengthMin, SETTINGS.dendriteLengthMax);
-      const bend = rand(-0.6, 0.6);
-      const branchLength = rand(6, 14);
-      const branchSide = Math.random() > 0.5 ? 1 : -1;
-
-      return {
-        angle,
-        length,
-        bend,
-        branchLength,
-        branchSide,
-      };
-    });
+    const orientation = rand(0, Math.PI * 2);
+    const somaRadius = rand(11, 17);
 
     const somaPoints = [];
-    const pointCount = 14;
-    for (let i = 0; i < pointCount; i++) {
-      const angle = (i / pointCount) * Math.PI * 2;
-      const radius = baseRadius * rand(0.8, 1.22);
-      somaPoints.push({ angle, radius });
+    const somaPointCount = 16;
+    for (let i = 0; i < somaPointCount; i++) {
+      const a = (i / somaPointCount) * Math.PI * 2;
+      const r = somaRadius * rand(0.82, 1.20);
+      somaPoints.push({ angle: a, radius: r });
+    }
+
+    const dendrites = [];
+    const dendriteCount = Math.floor(rand(6, 10));
+    for (let i = 0; i < dendriteCount; i++) {
+      const local = rand(-1.55, 1.55);
+      const angle = orientation + Math.PI + local;
+      const len1 = rand(12, 22);
+      const len2 = rand(8, 18);
+      const bend = rand(-0.45, 0.45);
+      const branch = Math.random() > 0.5 ? 1 : -1;
+
+      dendrites.push({
+        angle,
+        len1,
+        len2,
+        bend,
+        branch,
+      });
     }
 
     return {
@@ -112,10 +117,14 @@
 
       swayPhaseX: rand(0, Math.PI * 2),
       swayPhaseY: rand(0, Math.PI * 2),
-      swaySpeedX: rand(0.0025, 0.004),
-      swaySpeedY: rand(0.0025, 0.004),
+      swaySpeedX: rand(0.0016, 0.0031),
+      swaySpeedY: rand(0.0016, 0.0031),
 
-      baseRadius,
+      orientation,
+      orientationPhase: rand(0, Math.PI * 2),
+      orientationSpeed: rand(0.0008, 0.0018),
+
+      somaRadius,
       somaPoints,
       dendrites,
 
@@ -123,190 +132,220 @@
       cooldown: 0,
       phase: rand(0, Math.PI * 2),
 
-      neighbors: [],
+      outgoing: [],
+      incoming: [],
     };
   }
 
-  function getSomaBoundaryPoint(n, angle) {
-    let closest = n.somaPoints[0];
+  function getSomaBoundaryPoint(neuron, angle) {
+    let bestPoint = neuron.somaPoints[0];
     let best = Infinity;
 
-    for (const p of n.somaPoints) {
-      let d = Math.abs(p.angle - angle);
-      d = Math.min(d, Math.PI * 2 - d);
+    for (const p of neuron.somaPoints) {
+      const d = Math.abs(angleWrap(p.angle - angle));
       if (d < best) {
         best = d;
-        closest = p;
+        bestPoint = p;
       }
     }
 
     return {
-      x: n.x + Math.cos(angle) * closest.radius,
-      y: n.y + Math.sin(angle) * closest.radius,
+      x: neuron.x + Math.cos(angle) * bestPoint.radius,
+      y: neuron.y + Math.sin(angle) * bestPoint.radius,
     };
   }
 
-  function createOrganicPath(a, b) {
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
+  function buildOrganicPath(aNeuron, bNeuron) {
+    const axonAngle = aNeuron.orientation;
+    const dendriteAngle = bNeuron.orientation + Math.PI;
+
+    const start = getSomaBoundaryPoint(aNeuron, axonAngle);
+    const end = getSomaBoundaryPoint(bNeuron, dendriteAngle);
+
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
     const len = Math.hypot(dx, dy) || 1;
+
     const ux = dx / len;
     const uy = dy / len;
     const nx = -uy;
     const ny = ux;
 
-    const startAngle = Math.atan2(dy, dx);
-    const endAngle = Math.atan2(-dy, -dx);
+    const p1 = {
+      x: start.x + Math.cos(axonAngle) * rand(30, 65) + nx * rand(-8, 8),
+      y: start.y + Math.sin(axonAngle) * rand(30, 65) + ny * rand(-8, 8),
+    };
 
-    const start = getSomaBoundaryPoint(a, startAngle);
-    const end = getSomaBoundaryPoint(b, endAngle);
+    const midBias = rand(-32, 32);
+    const p2 = {
+      x: lerp(start.x, end.x, 0.42) + nx * midBias,
+      y: lerp(start.y, end.y, 0.42) + ny * midBias,
+    };
 
-    const points = [start];
+    const p3 = {
+      x: lerp(start.x, end.x, 0.72) + nx * rand(-20, 20),
+      y: lerp(start.y, end.y, 0.72) + ny * rand(-20, 20),
+    };
 
-    const midCount = 3 + Math.floor(Math.random() * 2);
+    const p4 = {
+      x: end.x + Math.cos(dendriteAngle) * rand(10, 20),
+      y: end.y + Math.sin(dendriteAngle) * rand(10, 20),
+    };
 
-    for (let i = 1; i <= midCount; i++) {
-      const t = i / (midCount + 1);
-
-      const along = lerp(0, len, t);
-      const side = Math.sin(t * Math.PI) * rand(-26, 26);
-      const drift = rand(-10, 10);
-
-      points.push({
-        x: start.x + ux * (along + drift) + nx * side,
-        y: start.y + uy * (along + drift) + ny * side,
-      });
-    }
-
-    points.push(end);
-
-    return points;
+    const raw = [start, p1, p2, p3, p4, end];
+    return sampleSmoothPath(raw, 18);
   }
 
-  function buildConnections() {
-    edges = [];
-    neurons.forEach((n) => (n.neighbors = []));
+  function sampleSmoothPath(points, subdivisions) {
+    const sampled = [];
 
-    const used = new Set();
+    for (let i = 0; i < points.length - 1; i++) {
+      const p0 = points[Math.max(0, i - 1)];
+      const p1 = points[i];
+      const p2 = points[i + 1];
+      const p3 = points[Math.min(points.length - 1, i + 2)];
+
+      for (let j = 0; j < subdivisions; j++) {
+        const t = j / subdivisions;
+        const t2 = t * t;
+        const t3 = t2 * t;
+
+        const x =
+          0.5 *
+          ((2 * p1.x) +
+            (-p0.x + p2.x) * t +
+            (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+            (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+
+        const y =
+          0.5 *
+          ((2 * p1.y) +
+            (-p0.y + p2.y) * t +
+            (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+            (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+
+        sampled.push({ x, y });
+      }
+    }
+
+    sampled.push(points[points.length - 1]);
+    return sampled;
+  }
+
+  function buildEdges() {
+    edges = [];
+    neurons.forEach((n) => {
+      n.outgoing = [];
+      n.incoming = [];
+    });
 
     for (let i = 0; i < neurons.length; i++) {
+      const source = neurons[i];
       const candidates = [];
 
       for (let j = 0; j < neurons.length; j++) {
         if (i === j) continue;
-        const d = dist(neurons[i], neurons[j]);
-        if (d < SETTINGS.maxConnectionDistance) {
-          candidates.push({ j, d });
-        }
+
+        const target = neurons[j];
+        const d = dist(source, target);
+        if (d > SETTINGS.maxConnectionDistance) continue;
+
+        const toTarget = Math.atan2(target.y - source.y, target.x - source.x);
+        const alignment = Math.abs(angleWrap(toTarget - source.orientation));
+        candidates.push({ j, d, alignment });
       }
 
-      candidates.sort((a, b) => a.d - b.d);
+      candidates.sort((a, b) => {
+        const scoreA = a.d + a.alignment * 50;
+        const scoreB = b.d + b.alignment * 50;
+        return scoreA - scoreB;
+      });
 
       const count = Math.min(
-        SETTINGS.maxConnections,
-        Math.max(SETTINGS.minConnections, candidates.length)
+        SETTINGS.maxTargetsPerNeuron,
+        Math.max(1, candidates.length ? Math.floor(rand(1, SETTINGS.maxTargetsPerNeuron + 1)) : 0)
       );
 
       for (let k = 0; k < count; k++) {
-        if (!candidates[k]) continue;
+        const c = candidates[k];
+        if (!c) continue;
 
-        const j = candidates[k].j;
-        const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-        if (used.has(key)) continue;
-        used.add(key);
+        const path = buildOrganicPath(source, neurons[c.j]);
 
-        const path = createOrganicPath(neurons[i], neurons[j]);
-
-        edges.push({
-          i,
-          j,
+        const edge = {
+          from: i,
+          to: c.j,
           path,
           glow: 0,
-        });
+        };
 
-        neurons[i].neighbors.push(j);
-        neurons[j].neighbors.push(i);
+        edges.push(edge);
+        source.outgoing.push(c.j);
+        neurons[c.j].incoming.push(i);
       }
     }
   }
 
   function findEdge(from, to) {
-    return edges.find(
-      (e) => (e.i === from && e.j === to) || (e.i === to && e.j === from)
-    );
+    return edges.find((e) => e.from === from && e.to === to);
   }
 
-  function fireNeuron(index, depth = 0, fromIndex = null) {
+  function updateNeurons() {
+    for (const n of neurons) {
+      n.phase += 0.008;
+      n.swayPhaseX += n.swaySpeedX;
+      n.swayPhaseY += n.swaySpeedY;
+      n.orientationPhase += n.orientationSpeed;
+
+      n.homeX += n.homeVX;
+      n.homeY += n.homeVY;
+
+      if (n.homeX < 50 || n.homeX > width - 50) n.homeVX *= -1;
+      if (n.homeY < 50 || n.homeY > height - 50) n.homeVY *= -1;
+
+      if (mouse.x !== null) {
+        const dx = n.homeX - mouse.x;
+        const dy = n.homeY - mouse.y;
+        const d = Math.hypot(dx, dy);
+        if (d < 120 && d > 0) {
+          n.homeX += dx / 240;
+          n.homeY += dy / 240;
+        }
+      }
+
+      n.x = n.homeX + Math.sin(n.swayPhaseX) * SETTINGS.swayRadius;
+      n.y = n.homeY + Math.cos(n.swayPhaseY) * SETTINGS.swayRadius * 0.8;
+      n.orientation += Math.sin(n.orientationPhase) * 0.0008;
+
+      n.flash *= 0.95;
+      n.cooldown *= 0.975;
+    }
+
+    for (const e of edges) {
+      e.glow *= 0.93;
+    }
+  }
+
+  function fireNeuron(index, depth = 0) {
     const n = neurons[index];
     if (!n) return;
-    if (depth > 0 && n.cooldown > 0.45) return;
+    if (depth > 0 && n.cooldown > 0.55) return;
 
     n.flash = 1;
     n.cooldown = 1;
 
     if (depth >= SETTINGS.maxPropagationDepth) return;
 
-    const targets = n.neighbors.filter((neighbor) => neighbor !== fromIndex);
-
-    targets.forEach((targetIndex, order) => {
+    n.outgoing.forEach((target, order) => {
       signals.push({
         from: index,
-        to: targetIndex,
+        to: target,
         t: 0,
-        delay: order * 9 + rand(0, 12),
+        delay: order * 8 + rand(0, 10),
         speed: rand(SETTINGS.signalSpeedMin, SETTINGS.signalSpeedMax),
         depth: depth + 1,
       });
     });
-  }
-
-  function triggerNearestNeuron(x, y) {
-    let bestIndex = 0;
-    let bestDistance = Infinity;
-
-    neurons.forEach((n, i) => {
-      const d = Math.hypot(n.x - x, n.y - y);
-      if (d < bestDistance) {
-        bestDistance = d;
-        bestIndex = i;
-      }
-    });
-
-    fireNeuron(bestIndex, 0, null);
-  }
-
-  function updateNeurons() {
-    for (const n of neurons) {
-      n.phase += 0.01;
-      n.swayPhaseX += n.swaySpeedX;
-      n.swayPhaseY += n.swaySpeedY;
-
-      n.homeX += n.homeVX;
-      n.homeY += n.homeVY;
-
-      if (n.homeX < 40 || n.homeX > width - 40) n.homeVX *= -1;
-      if (n.homeY < 40 || n.homeY > height - 40) n.homeVY *= -1;
-
-      if (mouse.x !== null) {
-        const dx = n.homeX - mouse.x;
-        const dy = n.homeY - mouse.y;
-        const d = Math.hypot(dx, dy);
-        if (d < 110 && d > 0) {
-          n.homeX += dx / 220;
-          n.homeY += dy / 220;
-        }
-      }
-
-      n.x = n.homeX + Math.sin(n.swayPhaseX) * SETTINGS.swayRadius;
-      n.y = n.homeY + Math.cos(n.swayPhaseY) * SETTINGS.swayRadius;
-
-      n.flash *= 0.95;
-      n.cooldown *= 0.97;
-    }
-
-    for (const e of edges) {
-      e.glow *= 0.92;
-    }
   }
 
   function updateSignals() {
@@ -324,14 +363,37 @@
       if (edge) edge.glow = Math.max(edge.glow, 0.75);
 
       if (s.t >= 1) {
-        fireNeuron(s.to, s.depth, s.from);
+        fireNeuron(s.to, s.depth);
         signals.splice(i, 1);
       }
     }
   }
 
+  function maybeAmbientFire(timestamp) {
+    if (timestamp - lastAmbientFire > SETTINGS.ambientFireEveryMs) {
+      const idx = Math.floor(Math.random() * neurons.length);
+      fireNeuron(idx, 0);
+      lastAmbientFire = timestamp;
+    }
+  }
+
+  function triggerNearestNeuron(x, y) {
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+
+    neurons.forEach((n, i) => {
+      const d = Math.hypot(n.x - x, n.y - y);
+      if (d < bestDistance) {
+        bestDistance = d;
+        bestIndex = i;
+      }
+    });
+
+    fireNeuron(bestIndex, 0);
+  }
+
   function drawPolyline(points, color, width) {
-    if (!points.length) return;
+    if (points.length < 2) return;
 
     ctx.strokeStyle = color;
     ctx.lineWidth = width;
@@ -346,23 +408,23 @@
     ctx.stroke();
   }
 
-  function samplePathSegment(points, t0, t1) {
-    if (points.length < 2) return [];
+  function samplePathSegment(path, t0, t1) {
+    if (path.length < 2) return [];
 
-    const segments = points.length - 1;
     const out = [];
+    const segs = path.length - 1;
 
-    for (let i = 0; i < segments; i++) {
-      const segStart = i / segments;
-      const segEnd = (i + 1) / segments;
+    for (let i = 0; i < segs; i++) {
+      const a = i / segs;
+      const b = (i + 1) / segs;
 
-      if (t1 < segStart || t0 > segEnd) continue;
+      if (t1 < a || t0 > b) continue;
 
-      const localT0 = Math.max(0, (t0 - segStart) / (segEnd - segStart));
-      const localT1 = Math.min(1, (t1 - segStart) / (segEnd - segStart));
+      const localT0 = Math.max(0, (t0 - a) / (b - a));
+      const localT1 = Math.min(1, (t1 - a) / (b - a));
 
-      const pA = pointLerp(points[i], points[i + 1], localT0);
-      const pB = pointLerp(points[i], points[i + 1], localT1);
+      const pA = pointLerp(path[i], path[i + 1], localT0);
+      const pB = pointLerp(path[i], path[i + 1], localT1);
 
       if (!out.length) out.push(pA);
       out.push(pB);
@@ -371,12 +433,34 @@
     return out;
   }
 
+  function drawSignal(path, headT, tailLength) {
+    const tailT = Math.max(0, headT - tailLength);
+
+    const layers = 7;
+    for (let i = 0; i < layers; i++) {
+      const fracA = i / layers;
+      const fracB = (i + 1) / layers;
+
+      const segStart = lerp(tailT, headT, fracA);
+      const segEnd = lerp(tailT, headT, fracB);
+      const seg = samplePathSegment(path, segStart, segEnd);
+
+      const alpha = lerp(0.06, 0.42, fracB);
+      const width = lerp(1.0, 2.2, fracB);
+
+      drawPolyline(seg, `rgba(214, 228, 232, ${alpha})`, width);
+    }
+
+    const head = samplePathSegment(path, Math.max(0, headT - 0.015), headT);
+    drawPolyline(head, "rgba(235, 242, 244, 0.65)", 2.6);
+  }
+
   function drawConnections() {
     for (const e of edges) {
-      drawPolyline(e.path, "rgba(112, 138, 145, 0.10)", 0.85);
+      drawPolyline(e.path, "rgba(110, 126, 132, 0.10)", 0.8);
 
       if (e.glow > 0.02) {
-        drawPolyline(e.path, `rgba(170, 198, 205, ${e.glow * 0.12})`, 1.2);
+        drawPolyline(e.path, `rgba(168, 184, 190, ${e.glow * 0.12})`, 1.15);
       }
     }
   }
@@ -384,43 +468,36 @@
   function drawSignals() {
     for (const s of signals) {
       if (s.delay > 0) continue;
-
       const edge = findEdge(s.from, s.to);
       if (!edge) continue;
-
-      const headT = Math.min(1, s.t);
-      const tailT = Math.max(0, s.t - 0.18);
-
-      const segment = samplePathSegment(edge.path, tailT, headT);
-
-      drawPolyline(segment, "rgba(215, 228, 232, 0.36)", 1.6);
+      drawSignal(edge.path, Math.min(1, s.t), SETTINGS.signalTailLength);
     }
   }
 
   function drawNeuron(n) {
-    const baseGlow = 0.35 + 0.65 * Math.sin(n.phase);
+    const pulse = 0.35 + 0.65 * Math.sin(n.phase);
     const active = Math.min(1, n.flash);
 
-    // dendrites
+    // dendrite fan
     for (const d of n.dendrites) {
       const start = getSomaBoundaryPoint(n, d.angle);
 
       const mid = {
-        x: start.x + Math.cos(d.angle + d.bend * 0.4) * (d.length * 0.55),
-        y: start.y + Math.sin(d.angle + d.bend * 0.4) * (d.length * 0.55),
+        x: start.x + Math.cos(d.angle + d.bend * 0.5) * d.len1,
+        y: start.y + Math.sin(d.angle + d.bend * 0.5) * d.len1,
       };
 
       const tip = {
-        x: start.x + Math.cos(d.angle + d.bend) * d.length,
-        y: start.y + Math.sin(d.angle + d.bend) * d.length,
+        x: mid.x + Math.cos(d.angle + d.bend) * d.len2,
+        y: mid.y + Math.sin(d.angle + d.bend) * d.len2,
       };
 
       const branch = {
-        x: tip.x + Math.cos(d.angle + d.bend + d.branchSide * 0.75) * d.branchLength,
-        y: tip.y + Math.sin(d.angle + d.bend + d.branchSide * 0.75) * d.branchLength,
+        x: tip.x + Math.cos(d.angle + d.bend + d.branch * 0.75) * (d.len2 * 0.55),
+        y: tip.y + Math.sin(d.angle + d.bend + d.branch * 0.75) * (d.len2 * 0.55),
       };
 
-      ctx.strokeStyle = `rgba(118, 156, 166, ${0.08 + baseGlow * 0.03 + active * 0.18})`;
+      ctx.strokeStyle = `rgba(118, 132, 138, ${0.10 + pulse * 0.02 + active * 0.16})`;
       ctx.lineWidth = 1.0 + active * 0.35;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
@@ -433,45 +510,57 @@
       ctx.stroke();
     }
 
-    // soma blob
-    const blobPoints = n.somaPoints.map((p) => ({
+    // longer visible axon stub
+    const axonStart = getSomaBoundaryPoint(n, n.orientation);
+    const axonMid = {
+      x: axonStart.x + Math.cos(n.orientation) * 18,
+      y: axonStart.y + Math.sin(n.orientation) * 18,
+    };
+    const axonTip = {
+      x: axonMid.x + Math.cos(n.orientation + Math.sin(n.phase) * 0.08) * 12,
+      y: axonMid.y + Math.sin(n.orientation + Math.sin(n.phase) * 0.08) * 12,
+    };
+
+    ctx.strokeStyle = `rgba(122, 136, 142, ${0.10 + active * 0.18})`;
+    ctx.lineWidth = 1.15 + active * 0.25;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(axonStart.x, axonStart.y);
+    ctx.lineTo(axonMid.x, axonMid.y);
+    ctx.lineTo(axonTip.x, axonTip.y);
+    ctx.stroke();
+
+    // irregular soma
+    const blob = n.somaPoints.map((p) => ({
       x: n.x + Math.cos(p.angle) * p.radius,
       y: n.y + Math.sin(p.angle) * p.radius,
     }));
 
-    ctx.fillStyle = `rgba(145, 178, 186, ${0.16 + baseGlow * 0.05 + active * 0.12})`;
+    ctx.fillStyle = `rgba(142, 154, 160, ${0.16 + pulse * 0.04 + active * 0.10})`;
     ctx.beginPath();
-    ctx.moveTo(blobPoints[0].x, blobPoints[0].y);
+    ctx.moveTo(blob[0].x, blob[0].y);
 
-    for (let i = 1; i < blobPoints.length; i++) {
-      const prev = blobPoints[i - 1];
-      const curr = blobPoints[i];
+    for (let i = 1; i < blob.length; i++) {
+      const prev = blob[i - 1];
+      const curr = blob[i];
       const mx = (prev.x + curr.x) / 2;
       const my = (prev.y + curr.y) / 2;
       ctx.quadraticCurveTo(prev.x, prev.y, mx, my);
     }
 
-    const last = blobPoints[blobPoints.length - 1];
-    const first = blobPoints[0];
+    const last = blob[blob.length - 1];
+    const first = blob[0];
     const mx = (last.x + first.x) / 2;
     const my = (last.y + first.y) / 2;
     ctx.quadraticCurveTo(last.x, last.y, mx, my);
     ctx.closePath();
     ctx.fill();
 
-    // inner nucleus
-    ctx.fillStyle = `rgba(220, 232, 235, ${0.07 + active * 0.10})`;
+    // nucleus
+    ctx.fillStyle = `rgba(216, 226, 230, ${0.06 + active * 0.12})`;
     ctx.beginPath();
-    ctx.arc(n.x, n.y, n.baseRadius * 0.22, 0, Math.PI * 2);
+    ctx.arc(n.x, n.y, n.somaRadius * 0.22, 0, Math.PI * 2);
     ctx.fill();
-  }
-
-  function maybeAmbientFire(timestamp) {
-    if (timestamp - lastAmbientFire > SETTINGS.ambientFireEveryMs) {
-      const index = Math.floor(Math.random() * neurons.length);
-      fireNeuron(index, 0, null);
-      lastAmbientFire = timestamp;
-    }
   }
 
   function draw(timestamp = 0) {
@@ -481,7 +570,7 @@
 
     frameCounter++;
     if (frameCounter % SETTINGS.connectionRefreshFrames === 0) {
-      buildConnections();
+      buildEdges();
     }
 
     maybeAmbientFire(timestamp);
